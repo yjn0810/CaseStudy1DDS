@@ -1,0 +1,943 @@
+---
+title: "Employee Attrition Analysis and Prediction"
+subtitle: "MSDS 6306 | Case Study 1 | Frito Lay"
+author: "Yongjoon Cho"
+date: "2026-10-25"
+output:
+  html_document:
+    toc: true
+    toc_depth: 2
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=FALSE,
+                      fig.width=8, fig.height=4.5)
+options(width=110)
+```
+
+# 1. Data Loading
+
+DDSAnalytics analyzes employee turnover for Frito Lay using 870 labeled employee records. The analysis identifies differences in attrition rates, evaluates KNN and Naive Bayes models, and estimates the cost of prediction errors. The independent competition set contains 300 employees without attrition labels.
+
+```{r data-loading}
+required_packages <- c("ggplot2", "caret", "class", "e1071")
+missing_packages <- setdiff(required_packages, rownames(installed.packages()))
+if (length(missing_packages)) stop("Install required packages: ", paste(missing_packages, collapse=", "))
+library(ggplot2)
+library(caret)
+library(class)
+library(e1071)
+
+labeled_file <- "CaseStudy1-data.csv"
+competition_file <- "CaseStudy1CompSet No Attrition.csv"
+stopifnot(file.exists(labeled_file), file.exists(competition_file))
+data_eda <- read.csv(labeled_file, stringsAsFactors=FALSE)
+competition_eda <- read.csv(competition_file, stringsAsFactors=FALSE)
+stopifnot(nrow(data_eda)==870, nrow(competition_eda)==300,
+          all(c("ID","Attrition","MonthlyIncome") %in% names(data_eda)),
+          !anyDuplicated(data_eda$ID), !anyDuplicated(competition_eda$ID))
+cat("Labeled data:", nrow(data_eda), "employees,", ncol(data_eda), "variables\n")
+cat("Competition data:", nrow(competition_eda), "employees\n")
+cat("Missing values:", sum(is.na(data_eda)), "\n")
+cat("Duplicate IDs:", sum(duplicated(data_eda$ID)), "\n")
+attrition_counts <- table(data_eda$Attrition)
+knitr::kable(data.frame(Attrition=names(attrition_counts),
+                        Employees=as.integer(attrition_counts),
+                        Percent=round(100*as.numeric(attrition_counts)/nrow(data_eda),2)))
+```
+
+# 2. Exploratory Data Analysis
+
+All categorical percentages represent the percentage of employees who left within each category. Numerical plots compare employees who left and stayed.
+
+```{r eda-functions}
+cat_vars <- c("BusinessTravel","Department","Education","EducationField",
+              "EnvironmentSatisfaction","Gender","JobInvolvement","JobLevel",
+              "JobRole","JobSatisfaction","MaritalStatus","OverTime",
+              "PerformanceRating","RelationshipSatisfaction","StockOptionLevel",
+              "WorkLifeBalance")
+num_vars <- c("Age","DailyRate","DistanceFromHome","HourlyRate",
+              "MonthlyIncome","MonthlyRate","NumCompaniesWorked","PercentSalaryHike",
+              "TotalWorkingYears","TrainingTimesLastYear","YearsAtCompany",
+              "YearsInCurrentRole","YearsSinceLastPromotion","YearsWithCurrManager")
+stopifnot(all(c(cat_vars,num_vars) %in% names(data_eda)))
+
+rate_by <- function(variable) {
+  t <- table(Group=as.character(data_eda[[variable]]), Attrition=data_eda$Attrition)
+  n <- rowSums(t)
+  yes <- if ("Yes" %in% colnames(t)) t[,"Yes"] else rep(0,length(n))
+  data.frame(Group=names(n), Employees=as.integer(n), Leavers=as.integer(yes),
+             AttritionRate=100*as.numeric(yes)/as.numeric(n))
+}
+plot_rate <- function(variable) {
+  x <- rate_by(variable)
+  ggplot(x,aes(x=reorder(Group,AttritionRate),y=AttritionRate)) +
+    geom_col(fill="#53749A") + coord_flip() +
+    geom_text(aes(label=sprintf("%.1f%%",AttritionRate)),hjust=-.12,size=3) +
+    scale_y_continuous(limits=c(0,max(x$AttritionRate)*1.25+1)) +
+    labs(title=paste("Attrition Rate by",variable),x=NULL,y="Attrition Rate (%)") +
+    theme_minimal(base_size=11)
+}
+plot_box <- function(variable) {
+  ggplot(data_eda,aes(x=factor(Attrition,levels=c("No","Yes")),
+                      y=.data[[variable]],fill=Attrition)) +
+    geom_boxplot(outlier.alpha=.3) +
+    stat_summary(fun=mean,geom="point",shape=18,size=2.4) +
+    scale_fill_manual(values=c("No"="#53749A","Yes"="#B34A4A")) +
+    guides(fill="none") + labs(title=paste(variable,"by Attrition"),
+    subtitle="Diamond indicates group mean",x="Attrition",y=variable) +
+    theme_minimal(base_size=11)
+}
+```
+
+## 2.1 Categorical Variables — Slides 5–7
+
+Work-life balance, overtime, job involvement, satisfaction, business travel, education, marital status, job role, and department are shown in the main presentation.
+
+```{r main-categorical, fig.height=4.5}
+main_cat <- c("WorkLifeBalance","OverTime","JobInvolvement","JobSatisfaction",
+              "BusinessTravel","Education","MaritalStatus","JobRole","Department")
+for (v in main_cat) print(plot_rate(v))
+```
+
+## 2.2 Numerical Variables — Slides 8–9
+
+```{r main-numerical, fig.height=4.5}
+main_num <- c("TotalWorkingYears","YearsAtCompany","YearsInCurrentRole",
+              "YearsWithCurrManager","Age","DistanceFromHome",
+              "MonthlyIncome","NumCompaniesWorked")
+for (v in main_num) print(plot_box(v))
+```
+
+## 2.3 Appendix EDA — Slides 15–22
+
+Additional variable comparisons shown in the presentation appendix.
+
+```{r appendix-eda, fig.height=4.5}
+for (v in setdiff(cat_vars,main_cat)) print(plot_rate(v))
+for (v in setdiff(num_vars,main_num)) print(plot_box(v))
+```
+
+## 2.4 Three Key Attrition Factors
+
+Overtime, job involvement, and job role were selected from the observed rate differences and their relevance to employee retention. They are associations, not causal effects.
+
+```{r top-three}
+knitr::kable(rate_by("OverTime"), digits=2, caption="Attrition by overtime")
+```
+
+```{r top-three-involvement}
+knitr::kable(rate_by("JobInvolvement"), digits=2, caption="Attrition by job involvement")
+```
+
+```{r top-three-role}
+knitr::kable(rate_by("JobRole"), digits=2, caption="Attrition by job role")
+```
+
+# 3. KNN Classification
+
+Four predictors: Age, YearsInCurrentRole, OverTime, and JobRole. The model uses k = 29 and an attrition-vote threshold of 0.20. The split is stratified at 80/20 (training/holdout); repeated training-set validation uses 500 splits.
+
+```{r knn-final-code, echo=TRUE, results="hide", fig.show="hide"}
+SEED <- 6306
+K <- 29
+THRESHOLD <- 0.20
+FEATURES <- c("Age", "YearsInCurrentRole", "OverTime", "JobRole")
+
+set.seed(SEED)
+
+train_path <- "CaseStudy1-data.csv"
+competition_path <- "CaseStudy1CompSet No Attrition.csv"
+
+stopifnot(file.exists(train_path))
+stopifnot(file.exists(competition_path))
+
+df <- read.csv(train_path, stringsAsFactors = FALSE)
+competition <- read.csv(competition_path, stringsAsFactors = FALSE)
+
+stopifnot(
+  all(c("ID", "Attrition", FEATURES) %in% names(df)),
+  all(c("ID", FEATURES) %in% names(competition)),
+  nrow(competition) == 300L,
+  !anyDuplicated(df$ID),
+  !anyDuplicated(competition$ID)
+)
+
+df$Attrition <- factor(df$Attrition, levels = c("Yes", "No"))
+
+for (v in c("OverTime", "JobRole")) {
+  levels_v <- sort(unique(c(
+    as.character(df[[v]]),
+    as.character(competition[[v]])
+  )))
+  
+  df[[v]] <- factor(df[[v]], levels = levels_v)
+  competition[[v]] <- factor(competition[[v]], levels = levels_v)
+}
+
+for (v in c("Age", "YearsInCurrentRole")) {
+  df[[v]] <- as.numeric(df[[v]])
+  competition[[v]] <- as.numeric(competition[[v]])
+}
+
+stopifnot(
+  !anyNA(df[, c("ID", "Attrition", FEATURES)]),
+  !anyNA(competition[, c("ID", FEATURES)])
+)
+
+cat("\n========== ATTRITION DISTRIBUTION ==========\n")
+print(table(df$Attrition))
+print(round(100 * prop.table(table(df$Attrition)), 2))
+
+set.seed(SEED)
+
+train_index <- createDataPartition(
+  df$Attrition,
+  p = 0.80,
+  list = FALSE
+)
+
+train <- df[train_index, , drop = FALSE]
+test <- df[-train_index, , drop = FALSE]
+
+cat("\n========== DATA SPLIT ==========\n")
+cat("Training:", nrow(train), "\n")
+cat("Holdout:", nrow(test), "\n")
+
+prepare_knn <- function(training, testing) {
+  
+  dummies <- dummyVars(
+    ~ .,
+    data = training[, FEATURES, drop = FALSE],
+    fullRank = FALSE
+  )
+  
+  x_train <- as.matrix(predict(
+    dummies,
+    newdata = training[, FEATURES, drop = FALSE]
+  ))
+  
+  x_test <- as.matrix(predict(
+    dummies,
+    newdata = testing[, FEATURES, drop = FALSE]
+  ))
+  
+  stopifnot(
+    identical(colnames(x_train), colnames(x_test)),
+    all(is.finite(x_train)),
+    all(is.finite(x_test))
+  )
+  
+  mu <- colMeans(x_train)
+  sigma <- apply(x_train, 2, sd)
+  sigma[!is.finite(sigma) | sigma < 1e-8] <- 1
+  
+  x_train <- sweep(
+    sweep(x_train, 2, mu, "-"),
+    2, sigma, "/"
+  )
+  
+  x_test <- sweep(
+    sweep(x_test, 2, mu, "-"),
+    2, sigma, "/"
+  )
+  
+  list(train = x_train, test = x_test)
+}
+
+predict_knn <- function(training, testing, seed = SEED) {
+  
+  stopifnot(
+    nrow(training) >= K,
+    nrow(testing) >= 1L
+  )
+  
+  x <- prepare_knn(training, testing)
+  
+  set.seed(seed)
+  
+  pred <- class::knn(
+    train = x$train,
+    test = x$test,
+    cl = training$Attrition,
+    k = K,
+    prob = TRUE
+  )
+  
+  vote <- as.numeric(attr(pred, "prob"))
+  
+  p_yes <- ifelse(
+    as.character(pred) == "Yes",
+    vote,
+    1 - vote
+  )
+  
+  stopifnot(
+    length(p_yes) == nrow(testing),
+    all(is.finite(p_yes))
+  )
+  
+  as.numeric(p_yes)
+}
+
+evaluate_knn <- function(actual, probability) {
+  
+  actual <- factor(actual, levels = c("Yes", "No"))
+  
+  predicted <- factor(
+    ifelse(probability >= THRESHOLD, "Yes", "No"),
+    levels = c("Yes", "No")
+  )
+  
+  cm <- confusionMatrix(
+    predicted,
+    actual,
+    positive = "Yes"
+  )
+  
+  sensitivity <- unname(cm$byClass["Sensitivity"])
+  specificity <- unname(cm$byClass["Specificity"])
+  precision <- unname(cm$byClass["Pos Pred Value"])
+  
+  f1 <- if (
+    is.na(precision) ||
+    is.na(sensitivity) ||
+    precision + sensitivity == 0
+  ) {
+    0
+  } else {
+    2 * precision * sensitivity / (precision + sensitivity)
+  }
+  
+  metrics <- data.frame(
+    Accuracy = unname(cm$overall["Accuracy"]),
+    Sensitivity = sensitivity,
+    Specificity = specificity,
+    Precision = precision,
+    F1 = f1,
+    BalancedAccuracy = (sensitivity + specificity) / 2,
+    CombinedScore = sensitivity + specificity
+  )
+  
+  list(
+    metrics = metrics,
+    confusion_matrix = cm,
+    predictions = predicted
+  )
+}
+
+set.seed(SEED)
+
+iterations <- 500
+splitPerc <- 0.80
+
+validation_results <- data.frame(
+  Accuracy = numeric(iterations),
+  Sensitivity = numeric(iterations),
+  Specificity = numeric(iterations),
+  Precision = numeric(iterations),
+  F1 = numeric(iterations),
+  BalancedAccuracy = numeric(iterations),
+  CombinedScore = numeric(iterations)
+)
+
+for (i in seq_len(iterations)) {
+  
+  train_indices <- sample(
+    seq_len(nrow(train)),
+    size = round(splitPerc * nrow(train))
+  )
+  
+  tr <- train[train_indices, , drop = FALSE]
+  va <- train[-train_indices, , drop = FALSE]
+  
+  p <- predict_knn(
+    training = tr,
+    testing = va,
+    seed = SEED + i
+  )
+  
+  result <- evaluate_knn(
+    actual = va$Attrition,
+    probability = p
+  )
+  
+  validation_results[i, ] <- result$metrics[1, ]
+}
+
+cv_metrics <- as.data.frame(
+  lapply(validation_results, mean, na.rm = TRUE)
+)
+
+cv_result <- list(
+  metrics = cv_metrics,
+  validation_results = validation_results
+)
+
+cat("\n========== REPEATED VALIDATION ==========\n")
+cat("Method: Repeated Random 80/20 Train/Test Split\n")
+cat("Iterations:", iterations, "\n")
+cat("K:", K, "| Threshold:", THRESHOLD, "\n")
+
+print(
+  cv_result$metrics,
+  row.names = FALSE,
+  digits = 4
+)
+
+plot(
+  seq_len(iterations),
+  validation_results$Accuracy,
+  type = "l",
+  xlab = "Iteration",
+  ylab = "Accuracy",
+  main = "KNN: Repeated Validation Accuracy"
+)
+
+abline(
+  h = mean(validation_results$Accuracy, na.rm = TRUE),
+  col = "red",
+  lty = 2
+)
+
+train_probability <- predict_knn(train, train)
+train_result <- evaluate_knn(
+  actual = train$Attrition,
+  probability = train_probability
+)
+
+cat("\n========== TRAINING SET PERFORMANCE (IN-SAMPLE) ==========\n")
+print(train_result$metrics, row.names = FALSE, digits = 4)
+cat("\n========== TRAINING SET CONFUSION MATRIX ==========\n")
+print(train_result$confusion_matrix)
+
+holdout_probability <- predict_knn(train, test)
+
+holdout_result <- evaluate_knn(
+  test$Attrition,
+  holdout_probability
+)
+
+performance <- rbind(
+  data.frame(
+    Dataset = "Training (in-sample)",
+    train_result$metrics
+  ),
+  data.frame(
+    Dataset = "Repeated Random Split",
+    cv_result$metrics
+  ),
+  data.frame(
+    Dataset = "Holdout Test",
+    holdout_result$metrics
+  )
+)
+
+cat("\n========== KNN MODEL ==========\n")
+cat("Features:", paste(FEATURES, collapse = ", "), "\n")
+cat("K:", K, "| Threshold:", THRESHOLD, "\n")
+
+cat("\n========== PERFORMANCE ==========\n")
+print(
+  performance,
+  row.names = FALSE,
+  digits = 4
+)
+
+cat("\n========== HOLDOUT CONFUSION MATRIX ==========\n")
+print(holdout_result$confusion_matrix)
+
+cat("\n========== VALIDATION REQUIREMENT ==========\n")
+
+print(data.frame(
+  Dataset = performance$Dataset,
+  Sensitivity_Pass = performance$Sensitivity > 0.60,
+  Specificity_Pass = performance$Specificity > 0.60
+), row.names = FALSE)
+
+competition_probability <- predict_knn(df, competition)
+
+submission <- data.frame(
+  ID = competition$ID,
+  Attrition = ifelse(
+    competition_probability >= THRESHOLD,
+    "Yes",
+    "No"
+  )
+)
+
+submission <- submission[
+  order(submission$ID),
+  ,
+  drop = FALSE
+]
+
+rownames(submission) <- NULL
+
+stopifnot(
+  nrow(submission) == 300L,
+  identical(names(submission), c("ID", "Attrition")),
+  !anyNA(submission),
+  !anyDuplicated(submission$ID),
+  all(submission$Attrition %in% c("Yes", "No"))
+)
+
+output_file <- "Case1PredictionsCho_KNN_Comparison.csv"
+
+write.csv(
+  submission,
+  output_file,
+  row.names = FALSE
+)
+
+cat("\n========== COMPETITION PREDICTIONS ==========\n")
+cat("Output:", normalizePath(output_file), "\n")
+cat("Prediction Distribution:\n")
+print(table(submission$Attrition))
+```
+
+```{r save-knn-state, include=FALSE}
+knn_train_metrics <- train_result$metrics
+knn_cv_metrics <- cv_result$metrics
+knn_validation_results <- validation_results
+knn_holdout <- holdout_result
+knn_test <- test
+knn_train <- train
+knn_comp_prediction <- submission
+```
+
+# 4. Naive Bayes Classification
+
+Eight predictors: Age, DistanceFromHome, YearsAtCompany, JobInvolvement, WorkLifeBalance, BusinessTravel, OverTime, and JobRole. The model uses Laplace = 1 and an attrition-probability threshold of 0.21.
+
+```{r nb-final-code, echo=TRUE, results="hide", fig.show="hide"}
+SEED <- 6306
+LAPLACE <- 1
+THRESHOLD <- 0.21
+
+FEATURES <- c(
+  "Age",
+  "DistanceFromHome",
+  "YearsAtCompany",
+  "JobInvolvement",
+  "WorkLifeBalance",
+  "BusinessTravel",
+  "OverTime",
+  "JobRole"
+)
+
+CATEGORICAL <- c("BusinessTravel", "OverTime", "JobRole")
+
+set.seed(SEED)
+
+train_path <- "CaseStudy1-data.csv"
+competition_path <- "CaseStudy1CompSet No Attrition.csv"
+
+stopifnot(file.exists(train_path))
+stopifnot(file.exists(competition_path))
+
+df <- read.csv(train_path, stringsAsFactors = FALSE)
+competition <- read.csv(competition_path, stringsAsFactors = FALSE)
+
+stopifnot(
+  all(c("ID", "Attrition", FEATURES) %in% names(df)),
+  all(c("ID", FEATURES) %in% names(competition)),
+  nrow(competition) == 300L,
+  !anyDuplicated(df$ID),
+  !anyDuplicated(competition$ID)
+)
+
+df$Attrition <- factor(df$Attrition, levels = c("Yes", "No"))
+
+for (v in CATEGORICAL) {
+  levels_v <- sort(unique(c(
+    as.character(df[[v]]),
+    as.character(competition[[v]])
+  )))
+  
+  df[[v]] <- factor(df[[v]], levels = levels_v)
+  competition[[v]] <- factor(competition[[v]], levels = levels_v)
+}
+
+for (v in setdiff(FEATURES, CATEGORICAL)) {
+  df[[v]] <- as.numeric(df[[v]])
+  competition[[v]] <- as.numeric(competition[[v]])
+}
+
+stopifnot(
+  !anyNA(df[, c("ID", "Attrition", FEATURES)]),
+  !anyNA(competition[, c("ID", FEATURES)])
+)
+
+cat("\n========== ATTRITION DISTRIBUTION ==========\n")
+print(table(df$Attrition))
+print(round(100 * prop.table(table(df$Attrition)), 2))
+
+set.seed(SEED)
+
+train_index <- createDataPartition(
+  df$Attrition,
+  p = 0.80,
+  list = FALSE
+)
+
+train <- df[train_index, , drop = FALSE]
+test <- df[-train_index, , drop = FALSE]
+
+cat("\n========== DATA SPLIT ==========\n")
+cat("Training:", nrow(train), "\n")
+cat("Holdout:", nrow(test), "\n")
+
+predict_nb <- function(training, testing) {
+  
+  model <- e1071::naiveBayes(
+    x = training[, FEATURES, drop = FALSE],
+    y = training$Attrition,
+    laplace = LAPLACE
+  )
+  
+  probabilities <- predict(
+    model,
+    newdata = testing[, FEATURES, drop = FALSE],
+    type = "raw"
+  )
+  
+  p_yes <- as.numeric(probabilities[, "Yes"])
+  
+  stopifnot(
+    length(p_yes) == nrow(testing),
+    all(is.finite(p_yes))
+  )
+  
+  p_yes
+}
+
+evaluate_nb <- function(actual, probability) {
+  
+  actual <- factor(actual, levels = c("Yes", "No"))
+  
+  predicted <- factor(
+    ifelse(probability >= THRESHOLD, "Yes", "No"),
+    levels = c("Yes", "No")
+  )
+  
+  cm <- confusionMatrix(
+    predicted,
+    actual,
+    positive = "Yes"
+  )
+  
+  sensitivity <- unname(cm$byClass["Sensitivity"])
+  specificity <- unname(cm$byClass["Specificity"])
+  precision <- unname(cm$byClass["Pos Pred Value"])
+  
+  tp <- sum(predicted == "Yes" & actual == "Yes")
+  fp <- sum(predicted == "Yes" & actual == "No")
+  fn <- sum(predicted == "No" & actual == "Yes")
+  
+  f1 <- if ((2 * tp + fp + fn) == 0) {
+    0
+  } else {
+    2 * tp / (2 * tp + fp + fn)
+  }
+  
+  metrics <- data.frame(
+    Accuracy = unname(cm$overall["Accuracy"]),
+    Sensitivity = sensitivity,
+    Specificity = specificity,
+    Precision = precision,
+    F1 = f1,
+    BalancedAccuracy = (sensitivity + specificity) / 2,
+    CombinedScore = sensitivity + specificity
+  )
+  
+  list(
+    metrics = metrics,
+    confusion_matrix = cm,
+    predictions = predicted
+  )
+}
+
+set.seed(SEED)
+
+iterations <- 500
+splitPerc <- 0.80
+
+validation_results <- data.frame(
+  Accuracy = numeric(iterations),
+  Sensitivity = numeric(iterations),
+  Specificity = numeric(iterations),
+  Precision = numeric(iterations),
+  F1 = numeric(iterations),
+  BalancedAccuracy = numeric(iterations),
+  CombinedScore = numeric(iterations)
+)
+
+for (i in seq_len(iterations)) {
+  
+  train_indices <- sample(
+    seq_len(nrow(train)),
+    size = round(splitPerc * nrow(train))
+  )
+  
+  tr <- train[train_indices, , drop = FALSE]
+  va <- train[-train_indices, , drop = FALSE]
+  
+  p <- predict_nb(
+    training = tr,
+    testing = va
+  )
+  
+  result <- evaluate_nb(
+    actual = va$Attrition,
+    probability = p
+  )
+  
+  validation_results[i, ] <- result$metrics[1, ]
+}
+
+cv_metrics <- as.data.frame(
+  lapply(validation_results, mean, na.rm = TRUE)
+)
+
+cv_result <- list(
+  metrics = cv_metrics,
+  validation_results = validation_results
+)
+
+cat("\n========== REPEATED VALIDATION ==========\n")
+cat("Method: Repeated Random 80/20 Train/Test Split\n")
+cat("Iterations:", iterations, "\n")
+cat("Laplace:", LAPLACE, "| Threshold:", THRESHOLD, "\n")
+
+print(
+  cv_result$metrics,
+  row.names = FALSE,
+  digits = 4
+)
+
+plot(
+  seq_len(iterations),
+  validation_results$Accuracy,
+  type = "l",
+  xlab = "Iteration",
+  ylab = "Accuracy",
+  main = "Naive Bayes: Repeated Validation Accuracy"
+)
+
+abline(
+  h = mean(validation_results$Accuracy, na.rm = TRUE),
+  col = "red",
+  lty = 2
+)
+
+train_probability <- predict_nb(train, train)
+train_result <- evaluate_nb(
+  actual = train$Attrition,
+  probability = train_probability
+)
+
+cat("\n========== TRAINING SET PERFORMANCE (IN-SAMPLE) ==========\n")
+print(train_result$metrics, row.names = FALSE, digits = 4)
+cat("\n========== TRAINING SET CONFUSION MATRIX ==========\n")
+print(train_result$confusion_matrix)
+
+holdout_probability <- predict_nb(train, test)
+
+holdout_result <- evaluate_nb(
+  actual = test$Attrition,
+  probability = holdout_probability
+)
+
+performance <- rbind(
+  data.frame(
+    Dataset = "Training (in-sample)",
+    train_result$metrics
+  ),
+  data.frame(
+    Dataset = "Repeated Random Split",
+    cv_result$metrics
+  ),
+  data.frame(
+    Dataset = "Holdout Test",
+    holdout_result$metrics
+  )
+)
+
+cat("\n========== NAIVE BAYES MODEL ==========\n")
+cat("Features:", paste(FEATURES, collapse = ", "), "\n")
+cat("Laplace:", LAPLACE, "| Threshold:", THRESHOLD, "\n")
+
+cat("\n========== PERFORMANCE ==========\n")
+print(
+  performance,
+  row.names = FALSE,
+  digits = 4
+)
+
+cat("\n========== HOLDOUT CONFUSION MATRIX ==========\n")
+print(holdout_result$confusion_matrix)
+
+cat("\n========== VALIDATION REQUIREMENT ==========\n")
+
+print(
+  data.frame(
+    Dataset = performance$Dataset,
+    Sensitivity_Pass = performance$Sensitivity > 0.60,
+    Specificity_Pass = performance$Specificity > 0.60
+  ),
+  row.names = FALSE
+)
+
+competition_probability <- predict_nb(df, competition)
+
+submission <- data.frame(
+  ID = competition$ID,
+  Attrition = ifelse(
+    competition_probability >= THRESHOLD,
+    "Yes",
+    "No"
+  )
+)
+
+submission <- submission[
+  order(submission$ID),
+  ,
+  drop = FALSE
+]
+
+rownames(submission) <- NULL
+
+stopifnot(
+  nrow(submission) == 300L,
+  identical(names(submission), c("ID", "Attrition")),
+  !anyNA(submission),
+  !anyDuplicated(submission$ID),
+  all(submission$Attrition %in% c("Yes", "No"))
+)
+
+output_file <- "Case1PredictionsCho Attrition.csv"
+
+write.csv(
+  submission,
+  output_file,
+  row.names = FALSE
+)
+
+cat("\n========== COMPETITION PREDICTIONS ==========\n")
+cat("Output:", normalizePath(output_file), "\n")
+cat("Prediction Distribution:\n")
+print(table(submission$Attrition))
+```
+
+```{r save-nb-state, include=FALSE}
+nb_train_metrics <- train_result$metrics
+nb_cv_metrics <- cv_result$metrics
+nb_validation_results <- validation_results
+nb_holdout <- holdout_result
+nb_test <- test
+nb_comp_prediction <- submission
+```
+
+# 5. Model Comparison
+
+Sensitivity measures the share of actual leavers correctly identified. Specificity measures the share of employees who stayed correctly identified. A false positive is an employee incorrectly flagged as leaving; a false negative is a departing employee missed by the model.
+
+```{r performance-summary}
+make_row <- function(model, split, metrics) {
+  data.frame(Model=model, Evaluation=split,
+             Accuracy=100*metrics$Accuracy, Sensitivity=100*metrics$Sensitivity,
+             Specificity=100*metrics$Specificity, Precision=100*metrics$Precision,
+             F1=100*metrics$F1, SensPlusSpec=100*metrics$CombinedScore,
+             Meets60Pct=ifelse(metrics$Sensitivity>.6 & metrics$Specificity>.6,"PASS","FAIL"))
+}
+performance_table <- rbind(
+  make_row("KNN","Training (in-sample)",knn_train_metrics),
+  make_row("KNN","Repeated splits (mean)",knn_cv_metrics),
+  make_row("KNN","Holdout",knn_holdout$metrics),
+  make_row("Naive Bayes","Training (in-sample)",nb_train_metrics),
+  make_row("Naive Bayes","Repeated splits (mean)",nb_cv_metrics),
+  make_row("Naive Bayes","Holdout",nb_holdout$metrics))
+knitr::kable(performance_table,digits=2,
+             caption="Performance percentages; criterion requires BOTH sensitivity and specificity >60%")
+```
+
+```{r matrices}
+cat("KNN holdout confusion matrix\n")
+print(knn_holdout$confusion_matrix$table)
+cat("\nNaive Bayes holdout confusion matrix\n")
+print(nb_holdout$confusion_matrix$table)
+```
+
+# 6. Financial Analysis
+
+For the scenario below, every employee predicted to leave is offered $200. The calculation assumes that correctly flagged leavers accept the incentive and remain employed. Missed leavers generate a replacement cost of 50%, 100%, 200%, or 400% of annual income. These figures are hypothetical, not observed savings.
+
+```{r economics}
+financial_rows <- function(model_name, predicted, actual, monthly_income, rate) {
+  truth <- as.character(actual)
+  pred <- as.character(predicted)
+  salary <- 12 * monthly_income
+  flagged <- sum(pred=="Yes")
+  fn <- pred=="No" & truth=="Yes"
+  base <- sum(salary[truth=="Yes"])*rate
+  cost <- 200*flagged + rate*sum(salary[fn])
+  data.frame(Model=model_name, ReplacementRate=paste0(rate*100,"%"),
+             TP=sum(pred=="Yes" & truth=="Yes"), FP=sum(pred=="Yes" & truth=="No"),
+             FN=sum(fn), Flagged=flagged,
+             IncentiveCost=200*flagged, FNSalary=sum(salary[fn]),
+             NoInterventionBaseline=base, TotalEstimatedCost=cost,
+             PotentialSavings=base-cost)
+}
+stopifnot(identical(as.character(knn_test$Attrition),as.character(nb_test$Attrition)),
+          identical(knn_test$ID, nb_test$ID))
+scenarios <- do.call(rbind,lapply(c(.5,1,2,4),function(r) {
+  rbind(financial_rows("KNN",knn_holdout$predictions,knn_test$Attrition,knn_test$MonthlyIncome,r),
+        financial_rows("Naive Bayes",nb_holdout$predictions,nb_test$Attrition,nb_test$MonthlyIncome,r))
+}))
+knitr::kable(scenarios[,c("Model","ReplacementRate","TP","FP","FN","Flagged","IncentiveCost","FNSalary","TotalEstimatedCost","PotentialSavings")],
+             format.args=list(big.mark=","),caption="Holdout-based financial scenarios (USD assumptions)")
+```
+
+```{r cost-comparison}
+k <- scenarios[scenarios$Model=="KNN",]
+n <- scenarios[scenarios$Model=="Naive Bayes",]
+comparison_cost <- data.frame(ReplacementCostAssumption=k$ReplacementRate,
+                              KNN_Total_Cost=k$TotalEstimatedCost,
+                              NaiveBayes_Total_Cost=n$TotalEstimatedCost,
+                              KNN_Cost_Advantage=n$TotalEstimatedCost-k$TotalEstimatedCost)
+knitr::kable(comparison_cost,format.args=list(big.mark=","),
+             caption="KNN estimated cost advantage relative to Naive Bayes")
+```
+
+The holdout model with better classification performance is not necessarily the model with the lowest assumed replacement cost: the annual salary of each missed leaver also affects the result.
+
+# 7. Competition Predictions
+
+The final Naive Bayes model is fit to all 870 labeled employees and generates 300 predictions, sorted by ID. Submit `Case1PredictionsCho Attrition.csv`.
+
+```{r verify-submission}
+submission_file <- "Case1PredictionsCho Attrition.csv"
+stopifnot(file.exists(submission_file))
+final_predictions <- read.csv(submission_file,stringsAsFactors=FALSE)
+stopifnot(nrow(final_predictions)==300L,
+          identical(names(final_predictions),c("ID","Attrition")),
+          identical(order(final_predictions$ID),seq_len(nrow(final_predictions))),
+          all(final_predictions$Attrition %in% c("Yes","No")),
+          !anyNA(final_predictions), !anyDuplicated(final_predictions$ID))
+knitr::kable(as.data.frame(table(final_predictions$Attrition)),col.names=c("Predicted Attrition","Count"),
+             caption="Unlabeled competition-set prediction distribution")
+```
+
+# 8. Results and Presentation
+
+The overall attrition rate is 16.1% (140 of 870). Overtime employees show 31.7% attrition compared with 9.7% without overtime. The lowest job involvement category has 46.8% attrition compared with 8.6% in the highest. Sales Representatives have 45.3% attrition.
+
+On the 174-person holdout, both models identify 20 of 28 leavers (71.43% sensitivity). Naive Bayes achieves 82.76% accuracy and 84.93% specificity, compared with KNN's 77.59% accuracy and 78.77% specificity. Naive Bayes is used for the competition prediction file; the retention-cost estimates depend on the stated incentive assumption.
+
+Presentation: `DS6306_Project_Final.pptx`  
+Video (YouTube or Zoom): [INSERT VIDEO URL]  
+GitHub repository: `CaseStudy1DDS`
+
+
